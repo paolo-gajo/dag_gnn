@@ -1,3 +1,5 @@
 data/
 src/gnn/tutorial
 src/gnn/ml-latest-small
+.vscode
+*.pyc

@@ -63,9 +63,9 @@ val_data, test_data = train_test_split(intermediate, test_size=0.5)
 # val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 # train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
 
-dataset = T.RandomLinkSplit(loader)
+# dataset = T.RandomLinkSplit(loader)
 
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import negative_sampling
 device = torch.device('cuda')
@@ -81,12 +81,29 @@ class Net(torch.nn.Module):
         return self.conv2(x, edge_index)
 
     def decode(self, z, edge_label_index):
-        return (z[edge_label_index[0]] * z[edge_label_index[1]]).sum(dim=-1)
+        # z holds the representations of the vertices
+        # and has len |V| for a graph G = (V, E)
+        # src and tgt hold the indices of the head/tail nodes
+        src = edge_label_index[0]
+        tgt = edge_label_index[1]
+        # when you index z like this `a` and `b` will have duplicate items
+        # because if you want to calculate the score s(head = 0, tail = 1)
+        # and the score s(head = 0, tail = 2) you are using the src tensor 0 twice
+        
+        # z.shape: [num_nodes, out_channels]
+        # src.shape: [num_edges]
+        # a.shape: [num_edges, out_channels]
+        
+        a = z[src]
+        b = z[tgt]
+        c = (a * b).sum(dim=-1)
+        
+        # c.shape: [num_edges]
+        return c
 
     def decode_all(self, z):
         prob_adj = z @ z.t()
         return (prob_adj > 0).nonzero(as_tuple=False).t()
-
 
 model = Net(embedder_model.config.hidden_size, 128, 64).to(device)
 optimizer = torch.optim.Adam(params=model.parameters(), lr=0.01)
@@ -95,8 +112,10 @@ criterion = torch.nn.BCEWithLogitsLoss()
 def train():
     model.train()
     optimizer.zero_grad()
-    total_loss = 0
-    for train_sample in tqdm(train_data, total=len(train_data), desc='Training...'):
+    total_epoch_loss = 0
+    loss = 0
+    pbar = tqdm(train_data, total=len(train_data), desc=f'Loss: {loss}')
+    for train_sample in pbar:
         x = train_sample.x.to(device)
         edges = train_sample.edge_index.to(device)
         z = model.encode(x, edges)
@@ -104,38 +123,58 @@ def train():
         # We perform a new round of negative sampling for every training epoch:
         neg_edge_index = negative_sampling(
             edge_index=train_sample.edge_index, num_nodes=train_sample.num_nodes,
-            num_neg_samples=train_sample.edge_label_index.size(1), method='sparse')
+            num_neg_samples=None, method='sparse')
+
+        # print('positive', train_sample.edge_index, train_sample.edge_index.shape)
+        # print('negative', neg_edge_index, neg_edge_index.shape)
 
         edge_label_index = torch.cat(
-            [train_sample.edge_label_index, neg_edge_index],
+            [train_sample.edge_index, neg_edge_index],
             dim=-1,
         )
+        # print('pos+neg', edge_label_index, edge_label_index.shape)
+
         edge_label = torch.cat([
-            train_sample.edge_label,
-            train_sample.edge_label.new_zeros(neg_edge_index.size(1))
-        ], dim=0)
+            torch.tensor((), dtype=torch.float32).new_ones(train_sample.edge_index.size(1)),
+            torch.tensor((), dtype=torch.float32).new_zeros(neg_edge_index.size(1))
+        ], dim=0).to(device)
 
         out = model.decode(z, edge_label_index).view(-1)
         loss = criterion(out, edge_label)
-        total_loss += loss
         loss.backward()
         optimizer.step()
-    return total_loss/len(train_data)
 
+        total_epoch_loss += loss.item()
+        pbar.set_description_str(f'Loss: {loss:.4f}')
+
+    avg_epoch_loss = total_epoch_loss / len(train_data)
+    print(f'Average epoch loss: {avg_epoch_loss:.4f}')
+    return avg_epoch_loss
 
 @torch.no_grad()
-def test(data):
+def test(data, split = ''):
     model.eval()
-    z = model.encode(data.x, data.edge_index)
-    out = model.decode(z, data.edge_label_index).view(-1).sigmoid()
-    return roc_auc_score(data.edge_label.cpu().numpy(), out.cpu().numpy())
+    preds = torch.tensor((), dtype=torch.float32).to(device)
+    trues = torch.tensor((), dtype=torch.float32).to(device)
+    for sample in tqdm(data, total=len(data), desc=f'Eval on split *{split}*...'):
+        x = sample.x.to(device)
+        edges = sample.edge_index.to(device)
+        z = model.encode(x, edges)
+        out = model.decode(z, sample.edge_index).view(-1).sigmoid()
+        preds = torch.cat([preds, out])
+        # trues = torch.cat([trues, data.edge_label])
+    trues = trues.new_ones(preds.size(0)).cpu().numpy()
+    preds = preds.cpu().numpy().round()
+    # return roc_auc_score(trues, preds)
+    return f1_score(trues, preds)
+    # return roc_auc_score(data.edge_label.cpu().numpy(), out.cpu().numpy())
 
 
 best_val_auc = final_test_auc = 0
 for epoch in range(1, 101):
     loss = train()
-    val_auc = test(val_data)
-    test_auc = test(test_data)
+    val_auc = test(val_data, split = 'val')
+    test_auc = test(test_data, split = 'test')
     if val_auc > best_val_auc:
         best_val_auc = val_auc
         final_test_auc = test_auc

@@ -244,7 +244,8 @@ def to_heterodata(graph, pos_tags, triples):
 
 def get_reps(sequences, tokenizer, model):
     inputs = tokenizer(sequences, return_tensors = 'pt', padding = True)
-    reps = model(**inputs).last_hidden_state
+    # only use the CLS token rep as pooling
+    reps = model(**inputs).last_hidden_state[:, 0]
     return reps
 
 def main():
